@@ -6,36 +6,60 @@ require "rubygems"
 require "rubygems/package_task"
 require "rake/testtask"
 
-require_relative "bundler/spec/support/rubygems_ext"
+module RubyGems
+  module DevTasks
+    include FileUtils
+
+    extend self
+
+    def bundle_dev_gemfile(*args)
+      sh "ruby", "-I", "lib", "bundler/spec/support/bundle.rb", *args, "--gemfile=tool/bundler/dev_gems.rb"
+    end
+
+    def bundle_support_gemfile(name, *args)
+      sh "ruby", "-I", "lib", "bundler/spec/support/bundle.rb", *args, "--gemfile=tool/bundler/#{name}.rb"
+    end
+
+    def update_locked_bundler
+      require "open3"
+
+      stdout, status = Open3.capture2e("ruby", "-I", "lib", "bundler/spec/support/bundle.rb", "--version")
+      raise "Failed to find current version of Bundler" unless status.success?
+
+      version = stdout.split(" ").last
+
+      Dir.glob("tool/bundler/*_gems.rb").each do |file|
+        name = File.basename(file, ".rb")
+        bundle_support_gemfile(name, "update", "--bundler", version)
+      end
+    end
+  end
+end
 
 desc "Setup Rubygems dev environment"
-task setup: [:"dev:deps"] do
+task :setup do
+  RubyGems::DevTasks.bundle_dev_gemfile "install"
   Dir.glob("tool/bundler/*_gems.rb").each do |file|
     name = File.basename(file, ".rb")
     next if name == "dev_gems"
-    Spec::Rubygems.dev_bundle "lock", gemfile: file
+    RubyGems::DevTasks.bundle_support_gemfile name, "lock"
   end
 end
 
 desc "Update Rubygems dev environment"
 task :update do
-  Spec::Rubygems.dev_bundle "update"
+  RubyGems::DevTasks.bundle_dev_gemfile "update"
   Dir.glob("tool/bundler/*_gems.rb").each do |file|
     name = File.basename(file, ".rb")
     next if name == "dev_gems"
-    Spec::Rubygems.dev_bundle "lock", "--update", gemfile: file
+    RubyGems::DevTasks.bundle_support_gemfile name, "lock", "--update"
   end
 end
 
 namespace :version do
   desc "Update the locked bundler version in dev environment"
   task update_locked_bundler: [:"bundler:install"] do |_, _args|
-    stdout = Spec::Rubygems.dev_bundle "--version"
-    version = stdout.split(" ").last
-
-    Dir.glob("tool/bundler/*_gems.rb").each do |file|
-      Spec::Rubygems.dev_bundle("update", "--bundler", version, gemfile: file)
-    end
+    RubyGems::DevTasks.update_locked_bundler
   end
 
   desc "Check locked bundler version is up to date"
@@ -49,14 +73,14 @@ end
 
 desc "Update specific development dependencies"
 task :update_dev_dep do |_, args|
-  Spec::Rubygems.dev_bundle "update", *args
+  RubyGems::DevTasks.bundle_dev_gemfile "update", *args
 end
 
 desc "Update RSpec related gems"
 task :update_rspec_deps do |_, _args|
-  Spec::Rubygems.dev_bundle "update", "rspec-core", "rspec-expectations", "rspec-mocks"
-  Spec::Rubygems.dev_bundle "lock", "--update", "rspec-core", "rspec-expectations", "rspec-mocks", gemfile: "tool/bundler/rubocop_gems.rb"
-  Spec::Rubygems.dev_bundle "lock", "--update", "rspec-core", "rspec-expectations", "rspec-mocks", gemfile: "tool/bundler/standard_gems.rb"
+  RubyGems::DevTasks.bundle_dev_gemfile "update", "rspec-core", "rspec-expectations", "rspec-mocks"
+  RubyGems::DevTasks.bundle_support_gemfile "rubocop_gems", "lock", "--update", "rspec-core", "rspec-expectations", "rspec-mocks"
+  RubyGems::DevTasks.bundle_support_gemfile "standard_gems", "lock", "--update", "rspec-core", "rspec-expectations", "rspec-mocks"
 end
 
 desc "Setup git hooks"
@@ -93,14 +117,14 @@ RDoc::Task.new rdoc: "docs", clobber_rdoc: "clobber_docs" do |doc|
   doc.title  = "RubyGems #{v} API Documentation"
 
   rdoc_files = Rake::FileList.new %w[lib bundler/lib]
-  rdoc_files.add %w[CHANGELOG.md LICENSE.txt MIT.txt CODE_OF_CONDUCT.md doc/rubygems/CONTRIBUTING.md
-                    doc/MAINTAINERS.txt Manifest.txt doc/rubygems/POLICIES.md README.md doc/rubygems/UPGRADING.md bundler/CHANGELOG.md
-                    doc/bundler/contributing/README.md bundler/LICENSE.md bundler/README.md
+  rdoc_files.add %w[CHANGELOG.md LICENSE.txt MIT.txt CODE_OF_CONDUCT.md CONTRIBUTING.md
+                    MAINTAINERS.txt Manifest.txt POLICIES.md README.md UPGRADING.md bundler/CHANGELOG.md
+                    bundler/doc/contributing/README.md bundler/LICENSE.md bundler/README.md
                     hide_lib_for_update/note.txt].map(&:freeze)
 
   doc.rdoc_files = rdoc_files
 
-  doc.rdoc_dir = "rdoc"
+  doc.rdoc_dir = "doc"
 end
 
 namespace :vendor do
@@ -228,8 +252,7 @@ file "pkg/rubygems-#{v}.tgz" => "pkg/rubygems-#{v}" do
     tar_version = `tar --version`
     if tar_version.include?("bsdtar")
       # bsdtar, as used by at least FreeBSD and macOS, uses `--uname` and `--gname`.
-      # COPYFILE_DISABLE prevents storing macOS extended attribute data in `._*` files inside the archive
-      sh({ "COPYFILE_DISABLE" => "1" }, "tar -czf rubygems-#{v}.tgz --uname=rubygems:0 --gname=rubygems:0 rubygems-#{v}")
+      sh "tar -czf rubygems-#{v}.tgz --uname=rubygems:0 --gname=rubygems:0 rubygems-#{v}"
     else # If a third variant is added, change this line to: elsif tar_version =~ /GNU tar/
       # GNU Tar, as used by many Linux distros, uses `--owner` and `--group`.
       sh "tar -czf rubygems-#{v}.tgz --owner=rubygems:0 --group=rubygems:0 rubygems-#{v}"
@@ -426,7 +449,7 @@ module Rubygems
   class ProjectFiles
     def self.all
       files = []
-      exclude = %r{\A(?:\.|bundler/(?!lib|exe|[^/]+\.md|bundler.gemspec)|tool/|Rakefile|bin|test|doc)}
+      exclude = %r{\A(?:\.|bundler/(?!lib|exe|[^/]+\.md|bundler.gemspec)|tool/|Rakefile|bin|test)}
       tracked_files = `git ls-files`.split("\n")
 
       tracked_files.each do |path|
@@ -434,15 +457,6 @@ module Rubygems
         next if path&.match?(exclude)
         files << path
       end
-
-      # Restore important documents
-      %w[
-        doc/MAINTAINERS.txt
-        doc/bundler/UPGRADING.md
-        doc/rubygems/CONTRIBUTING.md
-        doc/rubygems/POLICIES.md
-        doc/rubygems/UPGRADING.md
-      ].each {|f| files << f }
 
       files.sort
     end
@@ -491,6 +505,8 @@ task update_licenses_branch: :update_licenses do
   end
 end
 
+require_relative "bundler/spec/support/rubygems_ext"
+
 desc "Run specs"
 task :spec do
   chdir("bundler") do
@@ -501,7 +517,7 @@ end
 namespace :dev do
   desc "Ensure dev dependencies are installed"
   task :deps do
-    puts Spec::Rubygems.dev_bundle("install")
+    Spec::Rubygems.dev_setup
   end
 
   desc "Ensure dev dependencies are installed, and make sure no lockfile changes are generated"
@@ -514,14 +530,14 @@ namespace :dev do
 end
 
 namespace :spec do
-  desc "Ensure spec dependencies are installed (deprecated)"
+  desc "Ensure spec dependencies are installed"
   task deps: "dev:deps" do
-    warn "The `spec:deps` task is deprecated because test dependencies are now installed by the tests themselves. Use `dev:deps` task instead."
+    Spec::Rubygems.install_test_deps
   end
 
-  desc "Ensure spec dependencies for running in parallel are installed (deprecated)"
+  desc "Ensure spec dependencies for running in parallel are installed"
   task parallel_deps: "dev:deps" do
-    warn "The `spec:parallel_deps` task is deprecated because test dependencies are now installed by the tests themselves and don't need parallelization. Use `dev:deps` task instead."
+    Spec::Rubygems.install_parallel_test_deps
   end
 
   desc "Run all specs"
@@ -606,11 +622,11 @@ namespace :man do
     end
     task build_all_pages: "index.txt"
 
-    desc "Make sure ronn-ng is installed"
+    desc "Make sure nronn is installed"
     task :check_ronn do
-      Spec::Rubygems.gem_require("ronn-ng", "ronn")
+      Spec::Rubygems.gem_require("nronn", "ronn")
     rescue Gem::LoadError => e
-      abort("We couldn't activate ronn-ng (#{e.requirement}). Try `gem install ronn-ng:'#{e.requirement}'` to be able to build the help pages")
+      abort("We couldn't activate nronn (#{e.requirement}). Try `gem install nronn:'#{e.requirement}'` to be able to build the help pages")
     end
 
     desc "Remove all built man pages"
